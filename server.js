@@ -24,7 +24,7 @@ const STATIONS = {
   },
   shm: {
     name: 'Super Hot Mix Radio',
-    epochMs: 1787702400000,
+    epochMs: 1790380800000,
     tracksUrl: 'https://artieai-super-hot-mix-radio.static.hf.space/tracks.json',
     path: '/shm.mp3',
     tracks: [],
