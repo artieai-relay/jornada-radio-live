@@ -132,7 +132,45 @@ async function djLoop(key) {
       if (!st.tracks.length) { await sleep(15000); continue; }
       const pos = currentPosition(st.tracks, st.epochMs);
       if (!pos) { await sleep(15000); continue; }
-            let played = false; if (await checkAudio(pos.track.v)) { await playTrack(st, pos.track, pos.offset); played = true; } else { console.log(`[${st.name}] skip (unfetchable): ${pos.track.t}`); const candidates = []; for (let a = 1; a < 10; a++) { candidates.push(st.tracks[(pos.index + a) % st.tracks.length]); } const results = await Promise.all(candidates.map(async (t) => ({ track: t, ok: await checkAudio(t.v) }))); const found = results.find((r) => r.ok); for (const r of results) { if (!r.ok) console.log(`[${st.name}] skip (unfetchable): ${r.track.t}`); } if (found) { await playTrack(st, found.track, 0); played = true; } }
+      let played = false;
+      const t0 = Date.now();
+      st.badIds = st.badIds || new Map();
+      const blacklisted = st.badIds.get(pos.track.v) > Date.now();
+      // Try the scheduled track; if unfetchable, probe the next 9 in parallel
+      // and play the first that works (fast failover, ~6s worst case).
+      // Blacklisted = had an early exit recently, skip without probing.
+      const probeOk = blacklisted ? false : await checkAudio(pos.track.v);
+      if (probeOk) {
+        await playTrack(st, pos.track, pos.offset);
+        played = true;
+      } else {
+        if (blacklisted) console.log(`[${st.name}] skip (blacklisted): ${pos.track.t}`);
+        else console.log(`[${st.name}] skip (unfetchable): ${pos.track.t}`);
+        const candidates = [];
+        for (let a = 1; a < 10; a++) {
+          const t = st.tracks[(pos.index + a) % st.tracks.length];
+          if (st.badIds.get(t.v) > Date.now()) continue; // skip blacklisted
+          candidates.push(t);
+        }
+        const results = await Promise.all(
+          candidates.map(async (t) => ({ track: t, ok: await checkAudio(t.v) }))
+        );
+        const found = results.find((r) => r.ok);
+        for (const r of results) {
+          if (!r.ok) console.log(`[${st.name}] skip (unfetchable): ${r.track.t}`);
+        }
+        if (found) {
+          await playTrack(st, found.track, 0);
+          played = true;
+        }
+      }
+      const playedSec = (Date.now() - t0) / 1000;
+      if (played && playedSec < 45) {
+        // ffmpeg died almost immediately = flaky audio source, not a real
+        // track end. Skip this video for a while so we don't loop on it.
+        console.log(`[${st.name}] early exit after ${playedSec.toFixed(0)}s, blacklisting: ${pos.track.t}`);
+        st.badIds.set(pos.track.v, Date.now() + 30 * 60 * 1000);
+      }
       if (!played) {
         console.log(`[${st.name}] 10 tracks failed in a row, retrying in 20s`);
         await sleep(20000);
