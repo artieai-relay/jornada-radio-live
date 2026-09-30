@@ -70,7 +70,7 @@ function currentPosition(tracks, epochMs) {
 async function checkAudio(videoId) {
   try {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 15000);
+    const to = setTimeout(() => ctrl.abort(), 6000);
     const r = await fetch(WORKER_A + videoId + '.m4a', {
       headers: { Range: 'bytes=0-4095', 'User-Agent': UA },
       signal: ctrl.signal,
@@ -132,19 +132,7 @@ async function djLoop(key) {
       if (!st.tracks.length) { await sleep(15000); continue; }
       const pos = currentPosition(st.tracks, st.epochMs);
       if (!pos) { await sleep(15000); continue; }
-      let played = false;
-      // Try the scheduled track, then up to 9 following tracks if they 502.
-      for (let attempt = 0; attempt < 10; attempt++) {
-        const idx = (pos.index + attempt) % st.tracks.length;
-        const track = st.tracks[idx];
-        const off = attempt === 0 ? pos.offset : 0;
-        if (await checkAudio(track.v)) {
-          await playTrack(st, track, off);
-          played = true;
-          break;
-        }
-        console.log(`[${st.name}] skip (unfetchable): ${track.t}`);
-      }
+            let played = false; if (await checkAudio(pos.track.v)) { await playTrack(st, pos.track, pos.offset); played = true; } else { console.log(`[${st.name}] skip (unfetchable): ${pos.track.t}`); const candidates = []; for (let a = 1; a < 10; a++) { candidates.push(st.tracks[(pos.index + a) % st.tracks.length]); } const results = await Promise.all(candidates.map(async (t) => ({ track: t, ok: await checkAudio(t.v) }))); const found = results.find((r) => r.ok); for (const r of results) { if (!r.ok) console.log(`[${st.name}] skip (unfetchable): ${r.track.t}`); } if (found) { await playTrack(st, found.track, 0); played = true; } }
       if (!played) {
         console.log(`[${st.name}] 10 tracks failed in a row, retrying in 20s`);
         await sleep(20000);
