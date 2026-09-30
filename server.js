@@ -115,7 +115,7 @@ function broadcast(st, chunk) {
   }
 }
 
-function playTrack(st, track, offset) {
+function playTrack(st, track, offset, maxPlaySec) {
   return new Promise((resolve) => {
     const url = WORKER_A + track.v + '.m4a';
     const args = [
@@ -131,22 +131,36 @@ function playTrack(st, track, offset) {
     st.ring = []; st.ringBytes = 0; // new track: burst buffer starts fresh
     const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     st.currentFF = ff;
+    const startedAt = Date.now();
+    // A substitute track must never overrun the station slot it fills:
+    // kill it at the slot boundary so the loop resyncs to the clock.
+    let killTimer = null;
+    if (maxPlaySec && maxPlaySec > 0) {
+      killTimer = setTimeout(() => { try { ff.kill('SIGKILL'); } catch (_) {} }, maxPlaySec * 1000);
+    }
     let stderrTail = '';
     ff.stderr.on('data', (d) => { stderrTail = (stderrTail + d.toString()).slice(-500); });
     ff.stdout.on('data', (chunk) => broadcast(st, chunk));
     const done = () => {
+      if (killTimer) clearTimeout(killTimer);
       if (st.currentFF === ff) st.currentFF = null;
-      resolve();
+      resolve(Math.max(0, (Date.now() - startedAt) / 1000 - 1));
     };
     ff.on('close', (code) => {
-      if (code !== 0) console.log(`[${st.name}] ffmpeg exited code ${code}: ${stderrTail.slice(-200)}`);
+      const played = Math.max(0, (Date.now() - startedAt) / 1000 - 1);
+      console.log(`[${st.name}] ffmpeg closed code=${code} after ${played.toFixed(1)}s: ${track.t}${code ? ' | ' + stderrTail.slice(-200).trim().split('\n').pop() : ''}`);
       done();
     });
     ff.on('error', (e) => { console.log(`[${st.name}] ffmpeg error: ${e.message}`); done(); });
   });
 }
 
-// The DJ: keeps the stream on the station clock, skipping unfetchable tracks.
+// The DJ: keeps the stream glued to the station clock.
+// - If the scheduled track's source dies mid-play, RESUME the same track
+//   at the correct offset instead of jumping ahead to another song.
+// - A substitute track is cut off at the slot boundary, so a failover
+//   can never push the stream ahead of (or behind) the website clock
+//   past the end of the current song's slot.
 async function djLoop(key) {
   const st = STATIONS[key];
   if (st.djRunning) return;
@@ -157,20 +171,38 @@ async function djLoop(key) {
       if (!st.tracks.length) { await sleep(15000); continue; }
       const pos = currentPosition(st.tracks, st.epochMs);
       if (!pos) { await sleep(15000); continue; }
-      let played = false;
-      const t0 = Date.now();
       st.badIds = st.badIds || new Map();
+      const slotSec = pos.track.d - pos.offset; // seconds left in this slot
+      const slotEnd = Date.now() + slotSec * 1000;
+      let played = false;
       const blacklisted = st.badIds.get(pos.track.v) > Date.now();
-      // Try the scheduled track; if unfetchable, probe the next 9 in parallel
-      // and play the first that works (fast failover, ~6s worst case).
       // Blacklisted = had an early exit recently, skip without probing.
       const probeOk = blacklisted ? false : await checkAudio(pos.track.v);
       if (probeOk) {
-        await playTrack(st, pos.track, pos.offset);
-        played = true;
+        // Play the scheduled track, resuming at the right offset if its
+        // source dies early, until the slot is genuinely over.
+        let playedTotal = 0;
+        let guard = 0;
+        while (playedTotal < slotSec - 2 && st.clients.size > 0 && guard++ < 8 && Date.now() < slotEnd - 2000) {
+          const playedNow = await playTrack(st, pos.track, pos.offset + Math.floor(playedTotal), slotSec - playedTotal);
+          playedTotal += playedNow;
+          if (playedTotal >= slotSec - 2) break;
+          console.log(`[${st.name}] premature end at ${playedTotal.toFixed(0)}s of ${slotSec}s slot, resuming: ${pos.track.t}`);
+          if (!(await checkAudio(pos.track.v))) break; // source gone: fail over for the rest of the slot
+          await sleep(1500);
+        }
+        played = playedTotal > 0;
+        if (played && playedTotal < 45) {
+          // Died almost immediately every time = bad source. Skip this
+          // video for a while so we don't loop on it.
+          console.log(`[${st.name}] early exit after ${playedTotal.toFixed(0)}s, blacklisting: ${pos.track.t}`);
+          st.badIds.set(pos.track.v, Date.now() + 30 * 60 * 1000);
+        }
       } else {
         if (blacklisted) console.log(`[${st.name}] skip (blacklisted): ${pos.track.t}`);
         else console.log(`[${st.name}] skip (unfetchable): ${pos.track.t}`);
+        // Failover: probe the next 9 tracks in parallel and play the
+        // first that works — but only until this slot ends.
         const candidates = [];
         for (let a = 1; a < 10; a++) {
           const t = st.tracks[(pos.index + a) % st.tracks.length];
@@ -185,19 +217,19 @@ async function djLoop(key) {
           if (!r.ok) console.log(`[${st.name}] skip (unfetchable): ${r.track.t}`);
         }
         if (found) {
-          await playTrack(st, found.track, 0);
-          played = true;
+          const remain = Math.max(0, (slotEnd - Date.now()) / 1000);
+          if (remain > 5) {
+            const subPlayed = await playTrack(st, found.track, 0, remain);
+            played = true;
+            if (subPlayed < 45) {
+              console.log(`[${st.name}] early exit after ${subPlayed.toFixed(0)}s, blacklisting: ${found.track.t}`);
+              st.badIds.set(found.track.v, Date.now() + 30 * 60 * 1000);
+            }
+          }
         }
       }
-      const playedSec = (Date.now() - t0) / 1000;
-      if (played && playedSec < 45) {
-        // ffmpeg died almost immediately = flaky audio source, not a real
-        // track end. Skip this video for a while so we don't loop on it.
-        console.log(`[${st.name}] early exit after ${playedSec.toFixed(0)}s, blacklisting: ${pos.track.t}`);
-        st.badIds.set(pos.track.v, Date.now() + 30 * 60 * 1000);
-      }
       if (!played) {
-        console.log(`[${st.name}] 10 tracks failed in a row, retrying in 20s`);
+        console.log(`[${st.name}] nothing playable for this slot, retrying in 20s`);
         await sleep(20000);
       }
       // Loop re-syncs to the station clock after every track.
