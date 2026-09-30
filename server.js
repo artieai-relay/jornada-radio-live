@@ -26,6 +26,8 @@ const STATIONS = {
     djRunning: false,
     currentFF: null,
     idleTimer: null,
+    ring: [],
+    ringBytes: 0,
   },
   shm: {
     name: 'Super Hot Mix Radio',
@@ -37,10 +39,17 @@ const STATIONS = {
     djRunning: false,
     currentFF: null,
     idleTimer: null,
+    ring: [],
+    ringBytes: 0,
   },
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Ring buffer sizing (128 kbps = 16,000 bytes/s): keep 90s, burst the
+// last ~32s to each new listener on connect.
+const RING_CAP = 90 * 16000;
+const BURST_BYTES = 512 * 1024;
 
 async function refreshTracks() {
   for (const [key, st] of Object.entries(STATIONS)) {
@@ -90,6 +99,15 @@ async function checkAudio(videoId) {
 }
 
 function broadcast(st, chunk) {
+  // Keep the last ~90 seconds in a ring buffer: new listeners get an
+  // instant burst from it (Shoutcast/Icecast-style), because old players
+  // won't start playing a live stream that only trickles in at realtime
+  // rate — they prebuffer first, and a burst fills that buffer at once.
+  st.ring.push(chunk);
+  st.ringBytes += chunk.length;
+  while (st.ringBytes > RING_CAP && st.ring.length > 1) {
+    st.ringBytes -= st.ring.shift().length;
+  }
   for (const res of st.clients) {
     try {
       if (!res.write(chunk)) { /* backpressure: drop for slow clients, keep radio live */ }
@@ -110,6 +128,7 @@ function playTrack(st, track, offset) {
       '-f', 'mp3', '-',
     ];
     console.log(`[${st.name}] now playing: ${track.t} @${offset}s`);
+    st.ring = []; st.ringBytes = 0; // new track: burst buffer starts fresh
     const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     st.currentFF = ff;
     let stderrTail = '';
@@ -202,6 +221,23 @@ function attachClient(key, req, res) {
   // Flush headers + the silent pre-roll right away; ffmpeg audio follows
   // as soon as the DJ has the current track running.
   try { res.write(PREROLL); } catch (_) {}
+  // Instant burst: the last ~32s of audio, starting on a frame boundary.
+  // This is what makes old players start: their prebuffer fills at once
+  // instead of waiting ~30s for a realtime trickle to accumulate.
+  if (st.ringBytes > 0) {
+    const parts = [];
+    let take = BURST_BYTES;
+    for (let i = st.ring.length - 1; i >= 0 && take > 0; i--) {
+      const b = st.ring[i];
+      if (b.length <= take) { parts.unshift(b); take -= b.length; }
+      else { parts.unshift(b.subarray(b.length - take)); take = 0; }
+    }
+    const burst = Buffer.concat(parts);
+    let start = 0;
+    while (start < burst.length - 1 &&
+           !(burst[start] === 0xff && (burst[start + 1] & 0xe0) === 0xe0)) start++;
+    try { res.write(burst.subarray(start)); } catch (_) {}
+  }
   st.clients.add(res);
   if (st.idleTimer) { clearTimeout(st.idleTimer); st.idleTimer = null; }
   djLoop(key);
