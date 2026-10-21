@@ -106,6 +106,8 @@ function startPotServer() {
 }
 
 const urlCache = new Map(); // videoId -> { url, expires }
+const failCache = new Map(); // videoId -> timestamp of last failed self-resolve
+const pathHint = new Map(); // videoId -> 'worker' | 'direct' (which probe last succeeded)
 const lastResolveErrors = new Map(); // videoId -> [{client, ms, error}]
 const RESOLVE_CLIENTS = ['mweb', 'tv', 'web'];
 function ytDlpOnce(videoId, client) {
@@ -144,19 +146,35 @@ async function resolveViaYtDlp(videoId) {
 async function resolveAudioUrl(videoId) {
   const hit = urlCache.get(videoId);
   if (hit && hit.expires > Date.now() + 60000) return hit.url;
+  const failedAt = failCache.get(videoId);
+  if (failedAt && Date.now() - failedAt < 10 * 60 * 1000) return null;
   const { url } = await resolveViaYtDlp(videoId);
   if (url) {
+    failCache.delete(videoId);
     const m = url.match(/[?&]expire=(\d+)/);
     const expires = m ? parseInt(m[1], 10) * 1000 : Date.now() + 2 * 3600 * 1000;
     urlCache.set(videoId, { url, expires });
     return url;
   }
+  failCache.set(videoId, Date.now());
   return null;
 }
 
-// Probe: can we get audio for this video right now? Resolve a direct URL
-// locally and range-check it; fall back to the old Worker/Invidious probe.
+// Probe: can we get audio for this video right now? The public Worker
+// relay is the primary path (Tom's call, 2026-10-21 — the self-hosted
+// resolver is bot-walled for the catalog); self-resolution is the backup.
 async function checkAudio(videoId) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 6000);
+    const r = await fetch(WORKER_A + videoId + '.m4a', {
+      headers: { Range: 'bytes=0-4095', 'User-Agent': UA },
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (r.body) { try { await r.body.cancel(); } catch (_) {} }
+    if (r.status === 206 || r.status === 200) { pathHint.set(videoId, 'worker'); return true; }
+  } catch (_) { /* fall through to self-resolve */ }
   const direct = await resolveAudioUrl(videoId);
   if (direct) {
     try {
@@ -168,23 +186,11 @@ async function checkAudio(videoId) {
       });
       clearTimeout(to);
       if (r.body) { try { await r.body.cancel(); } catch (_) {} }
-      if (r.status === 206 || r.status === 200) return true;
+      if (r.status === 206 || r.status === 200) { pathHint.set(videoId, 'direct'); return true; }
       urlCache.delete(videoId);
-    } catch (_) { /* fall through to worker probe */ }
+    } catch (_) { /* no path worked */ }
   }
-  try {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 6000);
-    const r = await fetch(WORKER_A + videoId + '.m4a', {
-      headers: { Range: 'bytes=0-4095', 'User-Agent': UA },
-      signal: ctrl.signal,
-    });
-    clearTimeout(to);
-    if (r.body) { try { await r.body.cancel(); } catch (_) {} }
-    return r.status === 206 || r.status === 200;
-  } catch (_) {
-    return false;
-  }
+  return false;
 }
 
 function broadcast(st, chunk) {
@@ -205,7 +211,7 @@ function broadcast(st, chunk) {
 }
 
 async function playTrack(st, track, offset, maxPlaySec) {
-  const direct = await resolveAudioUrl(track.v);
+  const direct = pathHint.get(track.v) === 'direct' ? await resolveAudioUrl(track.v) : null;
   const url = direct || (WORKER_A + track.v + '.m4a');
   return new Promise((resolve) => {
     const args = [
