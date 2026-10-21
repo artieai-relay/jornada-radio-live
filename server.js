@@ -432,8 +432,32 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname.startsWith('/debug/resolve/')) {
     const id = url.pathname.slice('/debug/resolve/'.length).replace(/[^A-Za-z0-9_-]/g, '');
+    const savedClients = RESOLVE_CLIENTS.slice();
+    const qc = url.searchParams.get('clients');
+    if (qc) {
+      RESOLVE_CLIENTS.length = 0;
+      for (const c of qc.split(',').map((s) => s.trim()).filter(Boolean)) RESOLVE_CLIENTS.push(c);
+    }
     const r = await resolveViaYtDlp(id);
+    RESOLVE_CLIENTS.length = 0;
+    for (const c of savedClients) RESOLVE_CLIENTS.push(c);
+    if (url.searchParams.get('formats')) {
+      const client = (qc ? qc.split(',')[0].trim() : 'mweb') || 'mweb';
+      const listing = await new Promise((resolve) => {
+        execFile('yt-dlp', [
+          '--no-check-certificate',
+          '--extractor-args', 'youtube:player_client=' + client,
+          '-F', 'https://www.youtube.com/watch?v=' + id,
+        ], { timeout: 60000, maxBuffer: 1 << 22 }, (err, stdout, stderr) => {
+          const text = ((stdout || '') + '\n' + (stderr || '')).split('\n').slice(-45).join('\n');
+          resolve(text);
+        });
+      });
+      r.formatsClient = client;
+      r.formatsTail = listing;
+    }
     const out = { videoId: id, ok: !!r.url, attempts: r.attempts.map((a) => ({ client: a.client, ms: a.ms, error: a.error || null })) };
+    if (r.formatsTail) { out.formatsClient = r.formatsClient; out.formatsTail = r.formatsTail; }
     if (r.url) {
       try {
         const pu = new URL(r.url);
