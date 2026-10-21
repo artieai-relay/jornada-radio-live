@@ -92,8 +92,8 @@ let potProc = null;
 function startPotServer() {
   try {
     potProc = spawn('node', [BGUTIL_MAIN, '-p', '4416'], { stdio: ['ignore', 'pipe', 'pipe'] });
-    potProc.stdout.on('data', (d) => console.log('[pot] ' + d.toString().trim().split('\n').pop()));
-    potProc.stderr.on('data', (d) => console.log('[pot!] ' + d.toString().trim().split('\n').pop()));
+    potProc.stdout.on('data', (d) => d.toString().split('\n').map((s) => s.trim()).filter(Boolean).forEach((l) => console.log('[pot] ' + l)));
+    potProc.stderr.on('data', (d) => d.toString().split('\n').map((s) => s.trim()).filter(Boolean).forEach((l) => console.log('[pot!] ' + l)));
     potProc.on('close', (code) => {
       console.log(`[pot] token server exited code=${code}, restarting in 5s`);
       potProc = null;
@@ -106,25 +106,45 @@ function startPotServer() {
 }
 
 const urlCache = new Map(); // videoId -> { url, expires }
-function resolveViaYtDlp(videoId) {
+const lastResolveErrors = new Map(); // videoId -> [{client, ms, error}]
+const RESOLVE_CLIENTS = ['mweb', 'tv', 'web'];
+function ytDlpOnce(videoId, client) {
   return new Promise((resolve) => {
+    const t0 = Date.now();
     execFile('yt-dlp', [
       '--no-warnings', '--no-check-certificate',
-      '--extractor-args', 'youtube:player_client=mweb,web,tv',
+      '--extractor-args', 'youtube:player_client=' + client,
       '-f', 'bestaudio[ext=m4a]/bestaudio/best',
       '--get-url', 'https://www.youtube.com/watch?v=' + videoId,
-    ], { timeout: 60000, maxBuffer: 1 << 20 }, (err, stdout) => {
-      if (err) { resolve(null); return; }
+    ], { timeout: 45000, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+      const ms = Date.now() - t0;
+      if (err) {
+        const tail = (stderr || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-3).join(' | ');
+        resolve({ url: null, client, ms, error: tail || err.message });
+        return;
+      }
       const line = (stdout || '').split('\n').map((s) => s.trim()).find((s) => s.startsWith('http'));
-      resolve(line || null);
+      resolve(line ? { url: line, client, ms } : { url: null, client, ms, error: 'no url in stdout' });
     });
   });
+}
+async function resolveViaYtDlp(videoId) {
+  const attempts = [];
+  for (const client of RESOLVE_CLIENTS) {
+    const r = await ytDlpOnce(videoId, client);
+    attempts.push(r);
+    if (r.url) { lastResolveErrors.delete(videoId); return { url: r.url, attempts }; }
+  }
+  lastResolveErrors.set(videoId, attempts);
+  console.log(`[resolve] ${videoId} all clients failed: ` +
+    attempts.map((a) => `${a.client}(${a.ms}ms): ${a.error}`).join(' || '));
+  return { url: null, attempts };
 }
 
 async function resolveAudioUrl(videoId) {
   const hit = urlCache.get(videoId);
   if (hit && hit.expires > Date.now() + 60000) return hit.url;
-  const url = await resolveViaYtDlp(videoId);
+  const { url } = await resolveViaYtDlp(videoId);
   if (url) {
     const m = url.match(/[?&]expire=(\d+)/);
     const expires = m ? parseInt(m[1], 10) * 1000 : Date.now() + 2 * 3600 * 1000;
@@ -390,7 +410,7 @@ function attachClient(key, req, res) {
   });
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/house.mp3') return attachClient('house', req, res);
   if (url.pathname === '/shm.mp3') return attachClient('shm', req, res);
@@ -410,6 +430,22 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(s, null, 2));
     return;
   }
+  if (url.pathname.startsWith('/debug/resolve/')) {
+    const id = url.pathname.slice('/debug/resolve/'.length).replace(/[^A-Za-z0-9_-]/g, '');
+    const r = await resolveViaYtDlp(id);
+    const out = { videoId: id, ok: !!r.url, attempts: r.attempts.map((a) => ({ client: a.client, ms: a.ms, error: a.error || null })) };
+    if (r.url) {
+      try {
+        const pu = new URL(r.url);
+        out.host = pu.host; out.itag = pu.searchParams.get('itag');
+        out.expire = pu.searchParams.get('expire'); out.mime = pu.searchParams.get('mime');
+      } catch (_) {}
+      out.audioOk = await checkAudio(id);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Jornada Radio live MP3 — /house.mp3 /shm.mp3\n');
 });
@@ -417,6 +453,10 @@ const server = http.createServer((req, res) => {
 const PORT = process.env.PORT || 7860;
 (async () => {
   startPotServer();
+  execFile('yt-dlp', ['--version'], { timeout: 15000 }, (err, stdout) => {
+    if (err) console.log('[boot] yt-dlp --version FAILED: ' + err.message);
+    else console.log('[boot] yt-dlp version: ' + (stdout || '').trim());
+  });
   await refreshTracks();
   setInterval(refreshTracks, 60 * 60 * 1000); // pick up playlist edits hourly
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
