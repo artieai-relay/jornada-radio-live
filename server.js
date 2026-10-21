@@ -5,7 +5,7 @@
 // the hourly tracks.json refresh picks it up automatically.
 
 const http = require('http');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 
 const WORKER_A = 'https://jornada-radio.artieai.workers.dev/a/';
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
@@ -80,8 +80,78 @@ function currentPosition(tracks, epochMs) {
   return { index: 0, offset: 0, track: tracks[0] };
 }
 
-// Quick ranged probe: does the worker have audio for this video right now?
+/* --- Self-hosted audio resolution (yt-dlp + PO-token server) -----------
+ * YouTube now bot-walls every public Invidious/Piped resolver for music
+ * videos, so the server resolves audio itself: a local bgutil PO-token
+ * provider (spawned below) lets yt-dlp extract a direct googlevideo URL.
+ * Resolved URLs are IP-bound to this host, which is also the host that
+ * fetches them (ffmpeg), so they work end to end. The old Worker/Invidious
+ * path stays as a fallback in case a public instance ever revives. */
+const BGUTIL_MAIN = process.env.BGUTIL_MAIN || '/app/bgutil/server/build/main.js';
+let potProc = null;
+function startPotServer() {
+  try {
+    potProc = spawn('node', [BGUTIL_MAIN, '-p', '4416'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    potProc.stdout.on('data', (d) => console.log('[pot] ' + d.toString().trim().split('\n').pop()));
+    potProc.stderr.on('data', (d) => console.log('[pot!] ' + d.toString().trim().split('\n').pop()));
+    potProc.on('close', (code) => {
+      console.log(`[pot] token server exited code=${code}, restarting in 5s`);
+      potProc = null;
+      setTimeout(startPotServer, 5000);
+    });
+    console.log('[pot] token server starting on 127.0.0.1:4416');
+  } catch (e) {
+    console.log('[pot] failed to start token server: ' + e.message);
+  }
+}
+
+const urlCache = new Map(); // videoId -> { url, expires }
+function resolveViaYtDlp(videoId) {
+  return new Promise((resolve) => {
+    execFile('yt-dlp', [
+      '--no-warnings', '--no-check-certificate',
+      '--extractor-args', 'youtube:player_client=mweb,web,tv',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '--get-url', 'https://www.youtube.com/watch?v=' + videoId,
+    ], { timeout: 60000, maxBuffer: 1 << 20 }, (err, stdout) => {
+      if (err) { resolve(null); return; }
+      const line = (stdout || '').split('\n').map((s) => s.trim()).find((s) => s.startsWith('http'));
+      resolve(line || null);
+    });
+  });
+}
+
+async function resolveAudioUrl(videoId) {
+  const hit = urlCache.get(videoId);
+  if (hit && hit.expires > Date.now() + 60000) return hit.url;
+  const url = await resolveViaYtDlp(videoId);
+  if (url) {
+    const m = url.match(/[?&]expire=(\d+)/);
+    const expires = m ? parseInt(m[1], 10) * 1000 : Date.now() + 2 * 3600 * 1000;
+    urlCache.set(videoId, { url, expires });
+    return url;
+  }
+  return null;
+}
+
+// Probe: can we get audio for this video right now? Resolve a direct URL
+// locally and range-check it; fall back to the old Worker/Invidious probe.
 async function checkAudio(videoId) {
+  const direct = await resolveAudioUrl(videoId);
+  if (direct) {
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 10000);
+      const r = await fetch(direct, {
+        headers: { Range: 'bytes=0-1023', 'User-Agent': UA },
+        signal: ctrl.signal,
+      });
+      clearTimeout(to);
+      if (r.body) { try { await r.body.cancel(); } catch (_) {} }
+      if (r.status === 206 || r.status === 200) return true;
+      urlCache.delete(videoId);
+    } catch (_) { /* fall through to worker probe */ }
+  }
   try {
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), 6000);
@@ -90,7 +160,6 @@ async function checkAudio(videoId) {
       signal: ctrl.signal,
     });
     clearTimeout(to);
-    // Drain/close so we don't leak sockets.
     if (r.body) { try { await r.body.cancel(); } catch (_) {} }
     return r.status === 206 || r.status === 200;
   } catch (_) {
@@ -115,9 +184,10 @@ function broadcast(st, chunk) {
   }
 }
 
-function playTrack(st, track, offset, maxPlaySec) {
+async function playTrack(st, track, offset, maxPlaySec) {
+  const direct = await resolveAudioUrl(track.v);
+  const url = direct || (WORKER_A + track.v + '.m4a');
   return new Promise((resolve) => {
-    const url = WORKER_A + track.v + '.m4a';
     const args = [
       '-ss', String(offset),
       '-re',
@@ -139,10 +209,21 @@ function playTrack(st, track, offset, maxPlaySec) {
       killTimer = setTimeout(() => { try { ff.kill('SIGKILL'); } catch (_) {} }, maxPlaySec * 1000);
     }
     let stderrTail = '';
+    let lastDataAt = Date.now();
     ff.stderr.on('data', (d) => { stderrTail = (stderrTail + d.toString()).slice(-500); });
-    ff.stdout.on('data', (chunk) => broadcast(st, chunk));
+    ff.stdout.on('data', (chunk) => { lastDataAt = Date.now(); broadcast(st, chunk); });
+    // Watchdog: a wedged source can leave ffmpeg open but silent forever,
+    // which starves every listener while the DJ waits on it. Kill it so
+    // the loop can resume or fail over instead of hanging indefinitely.
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastDataAt > 25000) {
+        console.log(`[${st.name}] ffmpeg silent 25s, killing: ${track.t}`);
+        try { ff.kill('SIGKILL'); } catch (_) {}
+      }
+    }, 5000);
     const done = () => {
       if (killTimer) clearTimeout(killTimer);
+      clearInterval(watchdog);
       if (st.currentFF === ff) st.currentFF = null;
       resolve(Math.max(0, (Date.now() - startedAt) / 1000 - 1));
     };
@@ -176,8 +257,11 @@ async function djLoop(key) {
       const slotEnd = Date.now() + slotSec * 1000;
       let played = false;
       const blacklisted = st.badIds.get(pos.track.v) > Date.now();
+      // A track that just filled in as a substitute must not play again
+      // when its own slot arrives — that was the "same song twice" bug.
+      const justSubbed = st.lastSubId === pos.track.v && Date.now() - (st.lastSubAt || 0) < 12 * 60 * 1000;
       // Blacklisted = had an early exit recently, skip without probing.
-      const probeOk = blacklisted ? false : await checkAudio(pos.track.v);
+      const probeOk = (blacklisted || justSubbed) ? false : await checkAudio(pos.track.v);
       if (probeOk) {
         // Play the scheduled track, resuming at the right offset if its
         // source dies early, until the slot is genuinely over.
@@ -200,26 +284,42 @@ async function djLoop(key) {
         }
       } else {
         if (blacklisted) console.log(`[${st.name}] skip (blacklisted): ${pos.track.t}`);
+        else if (justSubbed) console.log(`[${st.name}] skip (just played as fill-in): ${pos.track.t}`);
         else console.log(`[${st.name}] skip (unfetchable): ${pos.track.t}`);
         // Failover: probe the next 9 tracks in parallel and play the
         // first that works — but only until this slot ends.
+        // Fill-ins come from well ahead in the rotation, never from the
+        // next few scheduled tracks: a fill-in that is also coming up
+        // soon would play twice in a row when its own slot arrives.
         const candidates = [];
-        for (let a = 1; a < 10; a++) {
+        for (let a = 6; a < 46 && candidates.length < 9; a++) {
           const t = st.tracks[(pos.index + a) % st.tracks.length];
+          if (t.v === pos.track.v || t.v === st.lastSubId) continue;
           if (st.badIds.get(t.v) > Date.now()) continue; // skip blacklisted
           candidates.push(t);
         }
-        const results = await Promise.all(
-          candidates.map(async (t) => ({ track: t, ok: await checkAudio(t.v) }))
-        );
-        const found = results.find((r) => r.ok);
-        for (const r of results) {
-          if (!r.ok) console.log(`[${st.name}] skip (unfetchable): ${r.track.t}`);
+        if (!candidates.length) {
+          for (let a = 2; a < 6; a++) {
+            const t = st.tracks[(pos.index + a) % st.tracks.length];
+            if (st.badIds.get(t.v) > Date.now()) continue;
+            candidates.push(t);
+          }
+        }
+        // Probe one at a time and take the first that works: resolving
+        // is a local yt-dlp run now, so parallel probing would swamp
+        // this small instance for no benefit.
+        let found = null;
+        for (const cand of candidates) {
+          if (st.clients.size === 0) break;
+          if (await checkAudio(cand.v)) { found = { track: cand, ok: true }; break; }
+          console.log(`[${st.name}] skip (unfetchable): ${cand.t}`);
         }
         if (found) {
           const remain = Math.max(0, (slotEnd - Date.now()) / 1000);
           if (remain > 5) {
             const subPlayed = await playTrack(st, found.track, 0, remain);
+            st.lastSubId = found.track.v;
+            st.lastSubAt = Date.now();
             played = true;
             if (subPlayed < 45) {
               console.log(`[${st.name}] early exit after ${subPlayed.toFixed(0)}s, blacklisting: ${found.track.t}`);
@@ -316,6 +416,7 @@ const server = http.createServer((req, res) => {
 
 const PORT = process.env.PORT || 7860;
 (async () => {
+  startPotServer();
   await refreshTracks();
   setInterval(refreshTracks, 60 * 60 * 1000); // pick up playlist edits hourly
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
