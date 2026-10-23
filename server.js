@@ -5,6 +5,7 @@
 // the hourly tracks.json refresh picks it up automatically.
 
 const http = require('http');
+const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 
 const WORKER_A = 'https://jornada-radio.artieai.workers.dev/a/';
@@ -105,6 +106,17 @@ function startPotServer() {
   }
 }
 
+// A signed-in YouTube session (cookies.txt) is what clears YouTube's
+// "Sign in to confirm you're not a bot" wall for the catalog (Tom's
+// call, 2026-10-22: use the Google account he saved for this). Render
+// mounts the secret file at /etc/secrets/cookies.txt; when it exists,
+// every yt-dlp call uses it.
+const COOKIES_PATH = process.env.COOKIES_PATH || '/etc/secrets/cookies.txt';
+function cookieArgs() {
+  try { if (fs.existsSync(COOKIES_PATH)) return ['--cookies', COOKIES_PATH]; } catch (_) {}
+  return [];
+}
+
 const urlCache = new Map(); // videoId -> { url, expires }
 const failCache = new Map(); // videoId -> timestamp of last failed self-resolve
 const pathHint = new Map(); // videoId -> 'worker' | 'direct' (which probe last succeeded)
@@ -115,6 +127,7 @@ function ytDlpOnce(videoId, client) {
     const t0 = Date.now();
     execFile('yt-dlp', [
       '--no-warnings', '--no-check-certificate',
+      ...cookieArgs(),
       '--extractor-args', 'youtube:player_client=' + client,
       '-f', 'bestaudio[ext=m4a]/bestaudio/best',
       '--get-url', 'https://www.youtube.com/watch?v=' + videoId,
@@ -160,21 +173,10 @@ async function resolveAudioUrl(videoId) {
   return null;
 }
 
-// Probe: can we get audio for this video right now? The public Worker
-// relay is the primary path (Tom's call, 2026-10-21 — the self-hosted
-// resolver is bot-walled for the catalog); self-resolution is the backup.
+// Probe: can we get audio for this video right now? Self-resolution with
+// the signed-in session is primary again (2026-10-22); the public Worker
+// relay remains as a fallback.
 async function checkAudio(videoId) {
-  try {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 6000);
-    const r = await fetch(WORKER_A + videoId + '.m4a', {
-      headers: { Range: 'bytes=0-4095', 'User-Agent': UA },
-      signal: ctrl.signal,
-    });
-    clearTimeout(to);
-    if (r.body) { try { await r.body.cancel(); } catch (_) {} }
-    if (r.status === 206 || r.status === 200) { pathHint.set(videoId, 'worker'); return true; }
-  } catch (_) { /* fall through to self-resolve */ }
   const direct = await resolveAudioUrl(videoId);
   if (direct) {
     try {
@@ -188,8 +190,19 @@ async function checkAudio(videoId) {
       if (r.body) { try { await r.body.cancel(); } catch (_) {} }
       if (r.status === 206 || r.status === 200) { pathHint.set(videoId, 'direct'); return true; }
       urlCache.delete(videoId);
-    } catch (_) { /* no path worked */ }
+    } catch (_) { /* fall through to worker probe */ }
   }
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 6000);
+    const r = await fetch(WORKER_A + videoId + '.m4a', {
+      headers: { Range: 'bytes=0-4095', 'User-Agent': UA },
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (r.body) { try { await r.body.cancel(); } catch (_) {} }
+    if (r.status === 206 || r.status === 200) { pathHint.set(videoId, 'worker'); return true; }
+  } catch (_) { /* no path worked */ }
   return false;
 }
 
@@ -452,6 +465,7 @@ const server = http.createServer(async (req, res) => {
       const listing = await new Promise((resolve) => {
         execFile('yt-dlp', [
           '--no-check-certificate',
+          ...cookieArgs(),
           '--extractor-args', 'youtube:player_client=' + client,
           '-F', 'https://www.youtube.com/watch?v=' + id,
         ], { timeout: 60000, maxBuffer: 1 << 22 }, (err, stdout, stderr) => {
@@ -487,6 +501,7 @@ const PORT = process.env.PORT || 7860;
     if (err) console.log('[boot] yt-dlp --version FAILED: ' + err.message);
     else console.log('[boot] yt-dlp version: ' + (stdout || '').trim());
   });
+  try { console.log('[boot] cookies file: ' + (fs.existsSync(COOKIES_PATH) ? 'present' : 'absent')); } catch (_) {}
   await refreshTracks();
   setInterval(refreshTracks, 60 * 60 * 1000); // pick up playlist edits hourly
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
